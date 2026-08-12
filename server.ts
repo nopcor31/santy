@@ -15,7 +15,7 @@ import nodemailer from 'nodemailer';
 import { createServer as createViteServer } from 'vite';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Configure body parser
 app.use(express.json({ limit: '50mb' }));
@@ -1018,7 +1018,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor iniciado en http://localhost:${PORT}`);
+    console.log(`Servidor iniciado en http://0.0.0.0:${PORT}`);
   });
 }
 
