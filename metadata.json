@@ -1,0 +1,6 @@
+{
+  "name": "Gestión de Documentos y Envíos",
+  "description": "Carga clientes desde Excel (CLINICA, REP_LEGAL, CORREO), edita sus datos, completa plantillas Word {{Clinica}}, {{Rep_legal}}, descarga en PDF y envía por correo electrónico.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
