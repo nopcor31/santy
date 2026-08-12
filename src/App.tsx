@@ -1,5 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { Client, WordTemplate, EmailConfig, EmailTemplate, ProcessingLog } from './types';
+import { parseApiResponse } from './utils/api';
 import { Navbar } from './components/Navbar';
 import { ClientTable } from './components/ClientTable';
 import { ClientEditModal } from './components/ClientEditModal';
@@ -109,9 +110,9 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ templateBase64: base64, name: file.name })
         });
-        const data = await res.json();
-        if (!res.ok || !data.success) {
-          alert(data.error || 'Error al guardar la plantilla en el servidor');
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data?.success) {
+          alert(parsed.error || 'Error al guardar la plantilla en el servidor');
           return;
         }
 
@@ -134,14 +135,19 @@ export default function App() {
   // Reset template to default
   const handleResetTemplate = async () => {
     try {
-      await fetch('/api/template/reset', { method: 'DELETE' });
-      setCurrentTemplate({
-        id: 'default_template',
-        name: 'Carta de Notificación Oficial (.docx)',
-        isDefault: true,
-        placeholders: ['Clinica', 'Rep_legal', 'Correo', 'Fecha', 'Ciudad']
-      });
-      alert('Se ha restablecido a la plantilla base del sistema.');
+      const res = await fetch('/api/template/reset', { method: 'DELETE' });
+      const parsed = await parseApiResponse(res);
+      if (parsed.ok) {
+        setCurrentTemplate({
+          id: 'default_template',
+          name: 'Carta de Notificación Oficial (.docx)',
+          isDefault: true,
+          placeholders: ['Clinica', 'Rep_legal', 'Correo', 'Fecha', 'Ciudad']
+        });
+        alert('Se ha restablecido a la plantilla base del sistema.');
+      } else {
+        alert(parsed.error || 'Error al restablecer plantilla.');
+      }
     } catch (err: any) {
       alert('Error al restablecer plantilla: ' + err.message);
     }
@@ -181,11 +187,11 @@ export default function App() {
             returnFormat: 'base64'
           })
         });
-        const genData = await genRes.json();
-        if (!genRes.ok || !genData.success || !genData.pdfBase64) {
-          throw new Error(genData.error || 'Error al generar el PDF nativo desde la plantilla Word');
+        const genParsed = await parseApiResponse(genRes);
+        if (!genParsed.ok || !genParsed.data?.success || !genParsed.data?.pdfBase64) {
+          throw new Error(genParsed.error || 'Error al generar el PDF nativo desde la plantilla Word');
         }
-        pdfBase64 = genData.pdfBase64;
+        pdfBase64 = genParsed.data.pdfBase64;
       }
 
       // Populate subject and body
@@ -212,8 +218,8 @@ export default function App() {
         })
       });
 
-      const data = await response.json();
-      if (response.ok && data.success) {
+      const parsed = await parseApiResponse(response);
+      if (parsed.ok && parsed.data?.success) {
         setClients(prev =>
           prev.map(c => (c.id === client.id ? { ...c, status: 'sent', lastSentAt: new Date().toLocaleTimeString() } : c))
         );
@@ -225,14 +231,14 @@ export default function App() {
           clientId: client.id,
           clientName: client.clinica,
           message: `Correo enviado exitosamente a ${client.rep_legal} (${client.correo})`,
-          testInboxUrl: data.testInboxUrl
+          testInboxUrl: parsed.data.testInboxUrl
         };
 
         setLogs(prev => [newLog, ...prev.slice(0, 150)]);
         if (isPreviewModalOpen) setIsPreviewModalOpen(false);
         alert(`¡Correo enviado con éxito a ${client.correo}!`);
       } else {
-        throw new Error(data.error || 'Error al enviar correo.');
+        throw new Error(parsed.error || 'Error al enviar correo.');
       }
     } catch (err: any) {
       setClients(prev =>
@@ -300,11 +306,11 @@ export default function App() {
           })
         });
 
-        const genData = await genRes.json();
-        if (genRes.ok && genData.success && genData.pdfBase64) {
-          pdfBase64 = genData.pdfBase64;
+        const genParsed = await parseApiResponse(genRes);
+        if (genParsed.ok && genParsed.data?.success && genParsed.data?.pdfBase64) {
+          pdfBase64 = genParsed.data.pdfBase64;
         } else {
-          throw new Error(genData.error || 'Error al generar el PDF nativo del documento Word');
+          throw new Error(genParsed.error || 'Error al generar el PDF nativo del documento Word');
         }
 
         const subject = emailTemplate.subject
@@ -330,8 +336,8 @@ export default function App() {
           })
         });
 
-        const sendData = await sendRes.json();
-        if (sendRes.ok && sendData.success) {
+        const sendParsed = await parseApiResponse(sendRes);
+        if (sendParsed.ok && sendParsed.data?.success) {
           setClients(prev =>
             prev.map(c => (c.id === client.id ? { ...c, status: 'sent' } : c))
           );
@@ -343,12 +349,12 @@ export default function App() {
               clientId: client.id,
               clientName: client.clinica,
               message: `[${index + 1}/${batchClients.length}] Correo enviado a ${client.clinica} (${client.correo})`,
-              testInboxUrl: sendData.testInboxUrl
+              testInboxUrl: sendParsed.data.testInboxUrl
             },
             ...prev.slice(0, 150)
           ]);
         } else {
-          throw new Error(sendData.error || 'Fallo de envío');
+          throw new Error(sendParsed.error || 'Fallo de envío');
         }
       } catch (err: any) {
         setClients(prev =>

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { EmailConfig, EmailTemplate } from '../types';
+import { parseApiResponse } from '../utils/api';
 import {
   X,
   Settings,
@@ -50,11 +51,11 @@ export const SmtpSettingsModal: React.FC<SmtpSettingsModalProps> = ({
         body: JSON.stringify(formData)
       });
 
-      const data = await response.json();
-      if (response.ok && data.success) {
-        setTestStatus({ success: true, message: data.message, details: data.details });
+      const parsed = await parseApiResponse(response);
+      if (parsed.ok && parsed.data?.success) {
+        setTestStatus({ success: true, message: parsed.data.message, details: parsed.data.details });
       } else {
-        setTestStatus({ success: false, message: data.error || 'Error de conexión SMTP.' });
+        setTestStatus({ success: false, message: parsed.error || 'Error de conexión SMTP.' });
       }
     } catch (err: any) {
       setTestStatus({ success: false, message: 'Error al conectar con el servidor: ' + err.message });

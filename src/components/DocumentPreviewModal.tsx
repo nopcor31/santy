@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { renderAsync } from 'docx-preview';
 import { Client, WordTemplate } from '../types';
 import { downloadBlob } from '../utils/pdfGenerator';
+import { parseApiResponse } from '../utils/api';
 import {
   X,
   FileText,
@@ -55,12 +56,12 @@ export const DocumentPreviewModal: React.FC<DocumentPreviewModalProps> = ({
           })
         });
 
-        const data = await response.json();
-        if (response.ok && data.success) {
-          setHtmlFallback(data.html);
-          setDocxBase64(data.docxBase64);
+        const parsed = await parseApiResponse(response);
+        if (parsed.ok && parsed.data?.success) {
+          setHtmlFallback(parsed.data.html);
+          setDocxBase64(parsed.data.docxBase64);
         } else {
-          setError(data.error || 'Error al generar la vista previa del documento.');
+          setError(parsed.error || 'Error al generar la vista previa del documento.');
         }
       } catch (err: any) {
         setError('Error de conexión con el servidor: ' + err.message);

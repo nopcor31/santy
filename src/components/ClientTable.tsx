@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef } from 'react';
 import { Client } from '../types';
+import { parseApiResponse } from '../utils/api';
 import {
   FileSpreadsheet,
   Upload,
@@ -119,13 +120,13 @@ export const ClientTable: React.FC<ClientTableProps> = ({
         body: formData
       });
 
-      const data = await response.json();
-      if (response.ok && data.success) {
-        setClients(data.clients);
-        setSelectedIds(new Set(data.clients.map((c: Client) => c.id)));
+      const parsed = await parseApiResponse(response);
+      if (parsed.ok && parsed.data?.success) {
+        setClients(parsed.data.clients);
+        setSelectedIds(new Set(parsed.data.clients.map((c: Client) => c.id)));
         setCurrentPage(1);
       } else {
-        alert(data.error || 'Error al cargar el archivo Excel.');
+        alert(parsed.error || 'Error al cargar el archivo Excel.');
       }
     } catch (err: any) {
       alert('Error de conexión al procesar el archivo Excel: ' + err.message);
@@ -145,7 +146,9 @@ export const ClientTable: React.FC<ClientTableProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clients: filteredClients })
       });
-      if (res.ok) {
+
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('spreadsheetml')) {
         const blob = await res.blob();
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -156,8 +159,8 @@ export const ClientTable: React.FC<ClientTableProps> = ({
         window.URL.revokeObjectURL(url);
         a.remove();
       } else {
-        const errJson = await res.json();
-        alert(errJson.error || 'Error exportando archivo Excel.');
+        const parsed = await parseApiResponse(res);
+        alert(parsed.error || 'Error exportando archivo Excel.');
       }
     } catch (err: any) {
       alert('Error de conexión al exportar: ' + err.message);

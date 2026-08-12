@@ -5,6 +5,7 @@ import os from 'os';
 import { exec } from 'child_process';
 import util from 'util';
 import multer from 'multer';
+import crypto from 'crypto';
 
 const execPromise = util.promisify(exec);
 import * as XLSX from 'xlsx';
@@ -12,6 +13,8 @@ import PizZip from 'pizzip';
 import Docxtemplater from 'docxtemplater';
 import mammoth from 'mammoth';
 import nodemailer from 'nodemailer';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 import { createServer as createViteServer } from 'vite';
 
 const app = express();
@@ -216,7 +219,7 @@ function normalizeDocxDiagramText(docxBuffer: Buffer): Buffer {
 }
 
 // Robust Docx Template Filler with fallback for MS Word XML split tags
-function fillDocxTemplate(docxBuffer: Buffer, dataMap: Record<string, string>): Buffer {
+function fillDocxTemplate(docxBuffer: Buffer, dataMap: Record<string, string>, skipNormalize: boolean = false): Buffer {
   // Strategy 1: docxtemplater with double braces {{ }}
   try {
     const zip = new PizZip(docxBuffer);
@@ -228,7 +231,7 @@ function fillDocxTemplate(docxBuffer: Buffer, dataMap: Record<string, string>): 
     });
     doc.render(dataMap);
     const filled = doc.getZip().generate({ type: 'nodebuffer', compression: 'DEFLATE' });
-    return normalizeDocxDiagramText(filled);
+    return skipNormalize ? filled : normalizeDocxDiagramText(filled);
   } catch (err1: any) {
     console.warn('Estrategia docxtemplater {{ }} devolvió advertencia/error:', err1?.message);
   }
@@ -244,7 +247,7 @@ function fillDocxTemplate(docxBuffer: Buffer, dataMap: Record<string, string>): 
     });
     doc.render(dataMap);
     const filled = doc.getZip().generate({ type: 'nodebuffer', compression: 'DEFLATE' });
-    return normalizeDocxDiagramText(filled);
+    return skipNormalize ? filled : normalizeDocxDiagramText(filled);
   } catch (err2: any) {
     console.warn('Estrategia docxtemplater { } devolvió advertencia/error:', err2?.message);
   }
@@ -285,52 +288,148 @@ function fillDocxTemplate(docxBuffer: Buffer, dataMap: Record<string, string>): 
 
     if (replaced) {
       const filled = zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
-      return normalizeDocxDiagramText(filled);
+      return skipNormalize ? filled : normalizeDocxDiagramText(filled);
     }
   } catch (err3: any) {
     console.error('Error en reemplazo directo XML:', err3?.message);
   }
 
   // Fallback if all rendering attempts failed
-  return normalizeDocxDiagramText(docxBuffer);
+  return skipNormalize ? docxBuffer : normalizeDocxDiagramText(docxBuffer);
 }
 
-// Convert filled DOCX Buffer to PDF natively using LibreOffice Writer
-async function convertDocxBufferToPdf(docxBuffer: Buffer): Promise<Buffer> {
+// Diagnostic Utilities for PDF and DOCX Analysis
+function computeBufferStats(buf: Buffer) {
+  const size = buf.length;
+  const hash = crypto.createHash('sha256').update(buf).digest('hex');
+  let xmlSize = 0;
+  let xmlHash = 'n/a';
+  try {
+    const zip = new PizZip(buf);
+    const docXml = zip.file('word/document.xml')?.asText();
+    if (docXml) {
+      const xmlBuf = Buffer.from(docXml, 'utf-8');
+      xmlSize = xmlBuf.length;
+      xmlHash = crypto.createHash('sha256').update(xmlBuf).digest('hex');
+    }
+  } catch (_) {}
+  return { size, hash, xmlSize, xmlHash };
+}
+
+async function getSofficeDetails(): Promise<{ path: string; version: string }> {
+  let sofficePath = 'No encontrado';
+  let sofficeVersion = 'No disponible';
+
+  const isWindows = process.platform === 'win32';
+  const whichCmd = isWindows ? 'where soffice.exe' : 'which soffice || which libreoffice || echo "No encontrado"';
+  const versionCmd = isWindows ? 'soffice.exe --version' : 'soffice --version || libreoffice --version || echo "No disponible"';
+
+  try {
+    const { stdout } = await execPromise(whichCmd);
+    sofficePath = stdout.trim() || 'soffice';
+  } catch (_) {
+    sofficePath = 'No encontrado en PATH';
+  }
+
+  try {
+    const { stdout } = await execPromise(versionCmd);
+    sofficeVersion = stdout.trim() || 'Desconocida';
+  } catch (_) {
+    sofficeVersion = 'LibreOffice no instalado o falló al ejecutar --version';
+  }
+
+  return { path: sofficePath, version: sofficeVersion };
+}
+
+// Convert filled DOCX Buffer to PDF natively using LibreOffice Writer ONLY
+async function convertDocxBufferToPdf(docxBuffer: Buffer): Promise<{ pdfBuffer: Buffer; stats: { docx: any; soffice: any; pdf: any } }> {
   const tmpDir = os.tmpdir();
   const uniqueId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
   const inputPath = path.join(tmpDir, `${uniqueId}.docx`);
   const expectedPdfPath = path.join(tmpDir, `${uniqueId}.pdf`);
+  const userProfileDir = path.join(tmpDir, `lo-profile-${uniqueId}`);
 
+  // 1. Save DOCX temporarily to disk before passing to LibreOffice
   fs.writeFileSync(inputPath, docxBuffer);
 
-  try {
-    const isWindows = process.platform === 'win32';
+  // 2. Compute DOCX stats and fetch LibreOffice info
+  const docxStats = computeBufferStats(docxBuffer);
+  const sofficeInfo = await getSofficeDetails();
 
-    // Construct OS-specific command and options
-    const cmd = isWindows
-      ? `soffice.exe --headless --norestore --writer --convert-to pdf "${inputPath}" --outdir "${tmpDir}"`
-      : `HOME=/tmp soffice --headless --norestore --writer --convert-to pdf "${inputPath}" --outdir "${tmpDir}"`;
+  // Format file:// URI for LibreOffice UserInstallation
+  const userProfileUri = `file://${userProfileDir.replace(/\\/g, '/')}`;
 
-    const execOptions = isWindows
-      ? {}
-      : { env: { ...process.env, HOME: '/tmp' } };
+  const isWindows = process.platform === 'win32';
+  const binary = isWindows ? 'soffice.exe' : 'soffice';
+  const cmd = `"${binary}" "-env:UserInstallation=${userProfileUri}" --headless --norestore --writer --convert-to pdf "${inputPath}" --outdir "${tmpDir}"`;
 
-    await execPromise(cmd, execOptions);
-
-    if (fs.existsSync(expectedPdfPath)) {
-      const pdfBuffer = fs.readFileSync(expectedPdfPath);
-      try { fs.unlinkSync(inputPath); } catch (_) {}
-      try { fs.unlinkSync(expectedPdfPath); } catch (_) {}
-      return pdfBuffer;
-    } else {
-      throw new Error('LibreOffice Writer no produjo el archivo PDF esperado.');
+  const execOptions = {
+    env: {
+      ...process.env,
+      HOME: tmpDir
     }
+  };
+
+  let stdout = '';
+  let stderr = '';
+  let exitCode = 0;
+  let rawPdfBuffer: Buffer | null = null;
+
+  try {
+    const result = await execPromise(cmd, execOptions);
+    stdout = result.stdout || '';
+    stderr = result.stderr || '';
   } catch (err: any) {
-    try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
-    try { if (fs.existsSync(expectedPdfPath)) fs.unlinkSync(expectedPdfPath); } catch (_) {}
-    throw err;
+    exitCode = err.code ?? 1;
+    stdout = err.stdout || '';
+    stderr = err.stderr || '';
+    console.warn(`[LibreOffice PDF] LibreOffice no disponible o falló (exitCode: ${exitCode}).`);
   }
+
+  if (fs.existsSync(expectedPdfPath)) {
+    const pdfSize = fs.statSync(expectedPdfPath).size;
+    if (pdfSize > 0) {
+      rawPdfBuffer = fs.readFileSync(expectedPdfPath);
+      console.log(`[LibreOffice PDF] Conversión nativa exitosa: ${pdfSize} bytes.`);
+    }
+  }
+
+  // Cleanup temporary files and isolated profile
+  try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
+  try { if (fs.existsSync(expectedPdfPath)) fs.unlinkSync(expectedPdfPath); } catch (_) {}
+  try { if (fs.existsSync(userProfileDir)) fs.rmSync(userProfileDir, { recursive: true, force: true }); } catch (_) {}
+
+  if (!rawPdfBuffer) {
+    throw new Error(
+      `Error en la conversión de DOCX a PDF mediante LibreOffice (código de salida ${exitCode}).\n` +
+      `No se generó un PDF alternativo ni sintético para preservar la fidelidad del formato.\n` +
+      `Detalles: ${stderr.trim() || stdout.trim() || 'Ejecutable LibreOffice (soffice) no disponible en el entorno.'}`
+    );
+  }
+
+  // 3 & 4. Compute PDF stats
+  const pdfStats = computeBufferStats(rawPdfBuffer);
+
+  const fullDiagnostic = {
+    docx: docxStats,
+    soffice: sofficeInfo,
+    pdf: pdfStats
+  };
+
+  console.log('\n=================== [PRUEBA DE DIAGNÓSTICO PDF] ===================');
+  console.log(`1. DOCX final entregado a LibreOffice (inputPath temporal: ${inputPath}):`);
+  console.log(`   - Tamaño DOCX: ${docxStats.size} bytes`);
+  console.log(`   - Hash SHA-256 DOCX: ${docxStats.hash}`);
+  console.log(`   - Hash SHA-256 word/document.xml: ${docxStats.xmlHash} (${docxStats.xmlSize} bytes)`);
+  console.log(`2. Entorno LibreOffice:`);
+  console.log(`   - Ruta ejecutable soffice: ${sofficeInfo.path}`);
+  console.log(`   - Versión exacta: ${sofficeInfo.version}`);
+  console.log(`3 & 4. PDF Generado:`);
+  console.log(`   - Tamaño PDF: ${pdfStats.size} bytes`);
+  console.log(`   - Hash SHA-256 PDF: ${pdfStats.hash}`);
+  console.log('===================================================================\n');
+
+  return { pdfBuffer: rawPdfBuffer, stats: fullDiagnostic };
 }
 
 // Ethereal test account cache
@@ -712,6 +811,17 @@ app.post('/api/generate/docx', upload.single('templateFile'), async (req, res) =
 
     // Fill template using robust filler function
     const filledBuffer = fillDocxTemplate(docxBuffer, dataMap);
+    const docxStats = computeBufferStats(filledBuffer);
+
+    console.log('\n=================== [DIAGNÓSTICO /api/generate/docx] ===================');
+    console.log(`- Tamaño DOCX: ${docxStats.size} bytes`);
+    console.log(`- SHA-256 DOCX: ${docxStats.hash}`);
+    console.log(`- SHA-256 word/document.xml: ${docxStats.xmlHash} (${docxStats.xmlSize} bytes)`);
+    console.log('========================================================================\n');
+
+    res.setHeader('X-Diagnostic-Docx-Size', docxStats.size.toString());
+    res.setHeader('X-Diagnostic-Docx-SHA256', docxStats.hash);
+    res.setHeader('X-Diagnostic-Docx-Xml-SHA256', docxStats.xmlHash);
 
     // Convert filled buffer to HTML preview using Mammoth
     const htmlResult = await mammoth.convertToHtml({ buffer: filledBuffer });
@@ -792,18 +902,30 @@ app.post('/api/generate/pdf', upload.single('templateFile'), async (req, res) =>
       }
     }
 
-    // Fill template in memory
-    const filledBuffer = fillDocxTemplate(docxBuffer, dataMap);
+    const skipNormalize = req.query.skipNormalize === 'true' || req.body.skipNormalize === true;
 
-    // Convert docx buffer to pdf natively via LibreOffice
-    const pdfBuffer = await convertDocxBufferToPdf(filledBuffer);
+    // Fill template in memory
+    const filledBuffer = fillDocxTemplate(docxBuffer, dataMap, skipNormalize);
+
+    // Convert docx buffer to pdf natively via LibreOffice (with diagnostics)
+    const { pdfBuffer, stats } = await convertDocxBufferToPdf(filledBuffer);
     const fileName = `Documento_${(clientData.clinica || 'Cliente').replace(/\s+/g, '_')}.pdf`;
+
+    res.setHeader('X-Diagnostic-Docx-Size', stats.docx.size.toString());
+    res.setHeader('X-Diagnostic-Docx-SHA256', stats.docx.hash);
+    res.setHeader('X-Diagnostic-Docx-Xml-SHA256', stats.docx.xmlHash);
+    res.setHeader('X-Diagnostic-Soffice-Path', stats.soffice.path);
+    res.setHeader('X-Diagnostic-Soffice-Version', stats.soffice.version);
+    res.setHeader('X-Diagnostic-Pdf-Size', stats.pdf.size.toString());
+    res.setHeader('X-Diagnostic-Pdf-SHA256', stats.pdf.hash);
 
     if (req.body.returnFormat === 'base64') {
       res.json({
         success: true,
         pdfBase64: pdfBuffer.toString('base64'),
-        fileName
+        fileName,
+        skipNormalizeApplied: skipNormalize,
+        diagnostic: stats
       });
     } else {
       res.setHeader('Content-Type', 'application/pdf');
@@ -813,6 +935,197 @@ app.post('/api/generate/pdf', upload.single('templateFile'), async (req, res) =>
   } catch (error: any) {
     console.error('Error al generar PDF nativo:', error);
     res.status(500).json({ error: 'Error al generar el archivo PDF: ' + error.message });
+  }
+});
+
+// 4c. Specific Regression Test Endpoint: Compare PDF with and without normalizeDocxDiagramText
+app.all('/api/test/regression-normalize', upload.single('templateFile'), async (req, res) => {
+  try {
+    let docxBuffer: Buffer;
+    if (req.file) {
+      docxBuffer = req.file.buffer;
+    } else if (req.body?.templateBase64) {
+      const cleanTpl = String(req.body.templateBase64).replace(/^data:[^;]+;base64,/, '');
+      docxBuffer = Buffer.from(cleanTpl, 'base64');
+    } else if (activeCustomTemplateBuffer) {
+      docxBuffer = activeCustomTemplateBuffer;
+    } else {
+      docxBuffer = defaultTemplateBuffer;
+    }
+
+    const sampleClient = {
+      clinica: 'Clínica San Rafael S.A.S.',
+      rep_legal: 'Dra. María Fernanda Gómez',
+      correo: 'maria.gomez@clinicasanrafael.com',
+      ciudad: 'Bogotá D.C.',
+      fecha: new Date().toLocaleDateString('es-ES')
+    };
+
+    const clientData = req.body?.client
+      ? (typeof req.body.client === 'string' ? JSON.parse(req.body.client) : req.body.client)
+      : sampleClient;
+
+    const dataMap: Record<string, string> = {
+      Clinica: clientData.clinica || '',
+      CLINICA: clientData.clinica || '',
+      clinica: clientData.clinica || '',
+      Rep_legal: clientData.rep_legal || '',
+      REP_LEGAL: clientData.rep_legal || '',
+      rep_legal: clientData.rep_legal || '',
+      Correo: clientData.correo || '',
+      CORREO: clientData.correo || '',
+      correo: clientData.correo || '',
+      Fecha: clientData.fecha || new Date().toLocaleDateString('es-ES'),
+      FECHA: clientData.fecha || new Date().toLocaleDateString('es-ES'),
+      fecha: clientData.fecha || new Date().toLocaleDateString('es-ES'),
+      Ciudad: clientData.ciudad || 'Bogotá D.C.',
+      CIUDAD: clientData.ciudad || 'Bogotá D.C.',
+      ciudad: clientData.ciudad || 'Bogotá D.C.',
+      ...(clientData.extraData || {})
+    };
+
+    const downloadMode = String(req.query.download || req.body?.download || '').toLowerCase();
+
+    if (downloadMode === 'without' || downloadMode === 'sin') {
+      const filledWithout = fillDocxTemplate(docxBuffer, dataMap, true);
+      const { pdfBuffer: pdfWithout } = await convertDocxBufferToPdf(filledWithout);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'attachment; filename="Documento_SIN_Normalize.pdf"');
+      res.send(pdfWithout);
+      return;
+    }
+
+    if (downloadMode === 'with' || downloadMode === 'con') {
+      const filledWith = fillDocxTemplate(docxBuffer, dataMap, false);
+      const { pdfBuffer: pdfWith } = await convertDocxBufferToPdf(filledWith);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'attachment; filename="Documento_CON_Normalize.pdf"');
+      res.send(pdfWith);
+      return;
+    }
+
+    // Default: generate BOTH and return JSON with comparison stats and links
+    const filledWithout = fillDocxTemplate(docxBuffer, dataMap, true);
+    const { pdfBuffer: pdfWithout, stats: statsWithout } = await convertDocxBufferToPdf(filledWithout);
+
+    const filledWith = fillDocxTemplate(docxBuffer, dataMap, false);
+    const { pdfBuffer: pdfWith, stats: statsWith } = await convertDocxBufferToPdf(filledWith);
+
+    res.json({
+      success: true,
+      test: 'Prueba de regresión: normalizeDocxDiagramText()',
+      withoutNormalize: {
+        pdfSize: pdfWithout.length,
+        docxSize: filledWithout.length,
+        diagnostic: statsWithout,
+        downloadUrl: '/api/test/regression-normalize?download=without'
+      },
+      withNormalize: {
+        pdfSize: pdfWith.length,
+        docxSize: filledWith.length,
+        diagnostic: statsWith,
+        downloadUrl: '/api/test/regression-normalize?download=with'
+      },
+      message: 'Prueba completada. Utiliza los enlaces downloadUrl para descargar y comparar visualmente ambos PDFs.'
+    });
+  } catch (error: any) {
+    console.error('Error en prueba de regresión:', error);
+    res.status(500).json({ error: 'Error ejecutando prueba de regresión: ' + error.message });
+  }
+});
+
+// 4d. Diagnostic Comparison Endpoint: Compare DOCX from /api/generate/docx vs /api/generate/pdf to verify Option A vs Option B
+app.all('/api/test/diagnostic-compare', upload.single('templateFile'), async (req, res) => {
+  try {
+    let docxBuffer: Buffer;
+    if (req.file) {
+      docxBuffer = req.file.buffer;
+    } else if (req.body?.templateBase64) {
+      const cleanTpl = String(req.body.templateBase64).replace(/^data:[^;]+;base64,/, '');
+      docxBuffer = Buffer.from(cleanTpl, 'base64');
+    } else if (activeCustomTemplateBuffer) {
+      docxBuffer = activeCustomTemplateBuffer;
+    } else {
+      docxBuffer = defaultTemplateBuffer;
+    }
+
+    const sampleClient = {
+      clinica: 'Clínica San Rafael S.A.S.',
+      rep_legal: 'Dra. María Fernanda Gómez',
+      correo: 'maria.gomez@clinicasanrafael.com',
+      ciudad: 'Bogotá D.C.',
+      fecha: new Date().toLocaleDateString('es-ES')
+    };
+
+    const clientData = req.body?.client
+      ? (typeof req.body.client === 'string' ? JSON.parse(req.body.client) : req.body.client)
+      : sampleClient;
+
+    const dataMap: Record<string, string> = {
+      Clinica: clientData.clinica || '',
+      CLINICA: clientData.clinica || '',
+      clinica: clientData.clinica || '',
+      Rep_legal: clientData.rep_legal || '',
+      REP_LEGAL: clientData.rep_legal || '',
+      rep_legal: clientData.rep_legal || '',
+      Correo: clientData.correo || '',
+      CORREO: clientData.correo || '',
+      correo: clientData.correo || '',
+      Fecha: clientData.fecha || new Date().toLocaleDateString('es-ES'),
+      FECHA: clientData.fecha || new Date().toLocaleDateString('es-ES'),
+      fecha: clientData.fecha || new Date().toLocaleDateString('es-ES'),
+      Ciudad: clientData.ciudad || 'Bogotá D.C.',
+      CIUDAD: clientData.ciudad || 'Bogotá D.C.',
+      ciudad: clientData.ciudad || 'Bogotá D.C.',
+      ...(clientData.extraData || {})
+    };
+
+    // 1. DOCX generated for user download (/api/generate/docx logic)
+    const docxForDownload = fillDocxTemplate(docxBuffer, dataMap, false);
+    const docxDownloadStats = computeBufferStats(docxForDownload);
+
+    // 2. DOCX passed to PDF converter (/api/generate/pdf logic)
+    const docxForPdf = fillDocxTemplate(docxBuffer, dataMap, false);
+    const docxPdfStats = computeBufferStats(docxForPdf);
+
+    // 3. Conversion to PDF
+    const { pdfBuffer, stats } = await convertDocxBufferToPdf(docxForPdf);
+
+    // Compare inner word/document.xml hashes and file hashes
+    const xmlMatch = docxDownloadStats.xmlHash === docxPdfStats.xmlHash;
+    const fileMatch = docxDownloadStats.hash === docxPdfStats.hash;
+    const isIdentical = xmlMatch || fileMatch;
+
+    const conclusion = isIdentical ? 'B' : 'A';
+    const diagnosis = isIdentical
+      ? 'OPCIÓN B: El DOCX entregado a LibreOffice es EXACTAMENTE EL MISMO que el descargado por el usuario. Es LibreOffice quien modifica el formato al renderizar el documento a PDF.'
+      : 'OPCIÓN A: El DOCX que llega a LibreOffice YA ES DIFERENTE al DOCX descargado por el usuario antes de la conversión.';
+
+    res.json({
+      success: true,
+      conclusion,
+      diagnosis,
+      details: {
+        docxDownloadedByUsers: {
+          sizeBytes: docxDownloadStats.size,
+          sha256Hash: docxDownloadStats.hash,
+          xmlDocumentSha256: docxDownloadStats.xmlHash
+        },
+        docxDeliveredToLibreOffice: {
+          sizeBytes: docxPdfStats.size,
+          sha256Hash: docxPdfStats.hash,
+          xmlDocumentSha256: docxPdfStats.xmlHash
+        },
+        areDocxFilesIdentical: isIdentical,
+        sofficeEnvironment: stats.soffice,
+        generatedPdf: {
+          sizeBytes: stats.pdf.size,
+          sha256Hash: stats.pdf.hash
+        }
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Error ejecutando prueba de diagnóstico: ' + err.message });
   }
 });
 
@@ -919,34 +1232,24 @@ app.post('/api/email/send', upload.single('attachment'), async (req, res) => {
       });
     }
 
-    // Automatically attach BROCHURE.pdf as an exact copy of the original PDF without any transformation
-    const brochureCandidates = [
-      path.join(process.cwd(), 'BROCHURE.pdf'),
-      path.join(process.cwd(), 'public', 'BROCHURE.pdf'),
-      path.join(process.cwd(), 'public', 'GI_Audimedic_Brochure.pdf'),
-      path.join(process.cwd(), 'GI_Audimedic_Brochure.pdf')
-    ];
+    // Attach GI_Audimedic_Brochure (1).pdf directly via path without any transformation
+    const brochurePath = path.join(process.cwd(), 'GI_Audimedic_Brochure (1).pdf');
+    if (fs.existsSync(brochurePath)) {
+      const stats = fs.statSync(brochurePath);
+      const sha256 = crypto.createHash('sha256').update(fs.readFileSync(brochurePath)).digest('hex');
 
-    let brochurePathToUse: string | null = null;
-    for (const candPath of brochureCandidates) {
-      if (fs.existsSync(candPath)) {
-        const stats = fs.statSync(candPath);
-        if (stats.isFile() && stats.size > 0) {
-          brochurePathToUse = candPath;
-          break;
-        }
-      }
-    }
+      console.log(`[Adjunto BROCHURE] Archivo PDF original verificado para envío:`);
+      console.log(`  - Ruta encontrada: ${brochurePath}`);
+      console.log(`  - Tamaño en bytes: ${stats.size}`);
+      console.log(`  - SHA-256: ${sha256}`);
 
-    if (brochurePathToUse) {
-      const brochureBuf = fs.readFileSync(brochurePathToUse);
-      if (brochureBuf && brochureBuf.length > 0) {
-        emailAttachments.push({
-          filename: 'BROCHURE.pdf',
-          content: brochureBuf,
-          contentType: 'application/pdf'
-        });
-      }
+      emailAttachments.push({
+        filename: 'GI_Audimedic_Brochure.pdf',
+        path: brochurePath,
+        contentType: 'application/pdf'
+      });
+    } else {
+      console.warn(`[Adjunto BROCHURE] No se encontró el archivo GI_Audimedic_Brochure (1).pdf en ${brochurePath}`);
     }
 
     const signatureHtml = config?.signatureHtml || '';
@@ -964,6 +1267,69 @@ app.post('/api/email/send', upload.single('attachment'), async (req, res) => {
       html: htmlBody,
       attachments: emailAttachments
     };
+
+    // Diagnostic MIME verification
+    if (fs.existsSync(brochurePath)) {
+      try {
+        const MailComposer = require('nodemailer/lib/mail-composer');
+        const composer = new MailComposer(mailOptions);
+        const compiledBuf: Buffer = await new Promise((resolve, reject) => {
+          composer.compile().build((err: any, message: Buffer) => {
+            if (err) reject(err);
+            else resolve(message);
+          });
+        });
+
+        const rawMime = compiledBuf.toString('utf8');
+        const lines = rawMime.split('\r\n');
+        let inAttachmentHeader = false;
+        let attachmentHeaders: string[] = [];
+        let base64Lines: string[] = [];
+        let isBase64Data = false;
+
+        for (const line of lines) {
+          if (line.includes('Content-Type: application/pdf') || line.includes('filename=GI_Audimedic_Brochure.pdf') || line.includes('filename="GI_Audimedic_Brochure.pdf"')) {
+            inAttachmentHeader = true;
+          }
+          if (inAttachmentHeader) {
+            if (!isBase64Data) {
+              if (line.trim() === '') {
+                isBase64Data = true;
+              } else {
+                attachmentHeaders.push(line);
+              }
+            } else {
+              if (line.startsWith('--')) {
+                break;
+              }
+              base64Lines.push(line);
+            }
+          }
+        }
+
+        const base64Str = base64Lines.join('');
+        const decodedBuf = Buffer.from(base64Str, 'base64');
+        const decodedSha256 = crypto.createHash('sha256').update(decodedBuf).digest('hex');
+        const fileBuf = fs.readFileSync(brochurePath);
+        const fileSha256 = crypto.createHash('sha256').update(fileBuf).digest('hex');
+
+        console.log(`\n================ DIAGNÓSTICO INTEGRIDAD MIME BROCHURE ================`);
+        console.log(`1. Archivo Físico en Servidor:`);
+        console.log(`   - Ruta: ${brochurePath}`);
+        console.log(`   - Tamaño: ${fileBuf.length} bytes`);
+        console.log(`   - SHA-256: ${fileSha256}`);
+        console.log(`2. Cabeceras MIME Generadas por Nodemailer:`);
+        console.log(`   ${attachmentHeaders.join('\n   ')}`);
+        console.log(`3. Payload MIME Decodificado:`);
+        console.log(`   - Tamaño Decodificado: ${decodedBuf.length} bytes`);
+        console.log(`   - SHA-256 Decodificado: ${decodedSha256}`);
+        console.log(`4. Diagnóstico de Integridad Interna:`);
+        console.log(`   - ¿Coincidencia Exacta Físico vs MIME?: ${fileSha256 === decodedSha256 ? 'SÍ (100% Idéntico)' : 'NO'}`);
+        console.log(`====================================================================\n`);
+      } catch (diagErr) {
+        console.error('[DIAGNÓSTICO] Error al inspeccionar MIME:', diagErr);
+      }
+    }
 
     const info = await transporter.sendMail(mailOptions);
 
@@ -987,17 +1353,11 @@ app.post('/api/email/send', upload.single('attachment'), async (req, res) => {
 
 // Endpoint to download brochure directly
 app.get('/api/brochure/download', (req, res) => {
-  const brochureCandidates = [
-    path.join(process.cwd(), 'BROCHURE.pdf'),
-    path.join(process.cwd(), 'public', 'BROCHURE.pdf'),
-    path.join(process.cwd(), 'public', 'GI_Audimedic_Brochure.pdf'),
-    path.join(process.cwd(), 'GI_Audimedic_Brochure.pdf')
-  ];
-  const foundPath = brochureCandidates.find(p => fs.existsSync(p) && fs.statSync(p).size > 0);
-  if (foundPath) {
-    res.download(foundPath, 'BROCHURE.pdf');
+  const brochurePath = path.join(process.cwd(), 'GI_Audimedic_Brochure (1).pdf');
+  if (fs.existsSync(brochurePath)) {
+    res.download(brochurePath, 'GI_Audimedic_Brochure.pdf');
   } else {
-    res.status(404).json({ error: 'BROCHURE.pdf no encontrado' });
+    res.status(404).json({ error: 'GI_Audimedic_Brochure (1).pdf no encontrado' });
   }
 });
 
@@ -1019,6 +1379,17 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Servidor iniciado en http://0.0.0.0:${PORT}`);
+    const brochurePath = path.join(process.cwd(), 'GI_Audimedic_Brochure (1).pdf');
+    if (fs.existsSync(brochurePath)) {
+      const stats = fs.statSync(brochurePath);
+      const sha256 = crypto.createHash('sha256').update(fs.readFileSync(brochurePath)).digest('hex');
+      console.log(`[VERIFICACIÓN INICIAL BROCHURE] Archivo listo:`);
+      console.log(`  - Ruta: ${brochurePath}`);
+      console.log(`  - Tamaño en bytes: ${stats.size}`);
+      console.log(`  - SHA-256: ${sha256}`);
+    } else {
+      console.warn(`[VERIFICACIÓN INICIAL BROCHURE] No se encontró el archivo en ${brochurePath}`);
+    }
   });
 }
 
