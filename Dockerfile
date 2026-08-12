@@ -8,7 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-dejavu \
     fontconfig \
+    which \
     && rm -rf /var/lib/apt/lists/*
+
+# Verify LibreOffice installation during image build
+RUN which soffice && soffice --version
 
 # Set working directory
 WORKDIR /app
